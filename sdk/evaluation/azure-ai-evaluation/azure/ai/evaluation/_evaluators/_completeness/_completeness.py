@@ -3,13 +3,15 @@
 # ---------------------------------------------------------
 
 import os
+import math
 import logging
 from typing import Dict, List, Union, Optional
 
 from typing_extensions import overload, override
 
+from azure.ai.evaluation._exceptions import EvaluationException, ErrorBlame, ErrorCategory, ErrorTarget
 from azure.ai.evaluation._evaluators._common import PromptyEvaluatorBase
-from azure.ai.evaluation._model_configurations import Conversation
+from azure.ai.evaluation._model_configurations import Conversation, Message
 
 
 logger = logging.getLogger(__name__)
@@ -65,28 +67,46 @@ class CompletenessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
     _RESULT_KEY = "completeness"
 
     id = "completeness"
+
+    MIN_COMPLETENESS_SCORE = 1
+    MAX_COMPLETENESS_SCORE = 5
+    DEFAULT_COMPLETENESS_THRESHOLD = 3
+
     """Evaluator identifier, experimental and to be used only with evaluation in cloud."""
 
     @override
-    def __init__(self, model_config):
+    def __init__(self, model_config, threshold: Optional[float] = DEFAULT_COMPLETENESS_THRESHOLD):
         current_dir = os.path.dirname(__file__)
         prompty_path = os.path.join(current_dir, self._PROMPTY_FILE)
+        self.threshold = threshold
         super().__init__(model_config=model_config, prompty_file=prompty_path, result_key=self._RESULT_KEY)
 
     @overload
     def __call__(
             self,
             *,
-            response: str,
             ground_truth: str,
-            threshold: Optional[float] = 3,
+            response: str,
     ) -> Dict[str, Union[str, float]]:
-        """Evaluate completeness in given response
+        """Evaluate completeness in given response. Accepts ground truth and response for evaluation.
 
+        Example usage:
+
+        Evaluating completeness for a response string
+
+        ```python
+        from azure.ai.evaluation import CompletenessEvaluator
+        completeness_evaluator = CompletenessEvaluator(model_config)
+        ground_truth = "The ground truth to be evaluated."
+        response = "The response to be evaluated."
+        completeness_results = completeness_evaluator(ground_truth=ground_truth, response=response)
+        ```
+        :keword ground_truth: The ground truth to be evaluated.
+        :paramtype ground_truth: str
         :keyword response: The response to be evaluated.
-        :paramtype response: str
-        :return: The fluency score
-        :rtype: Dict[str, float]
+        :paramtype response: Union[str, List[Message]]
+        :return: The response completeness score results.
+        :rtype: Dict[str, Union[str, float]]
         """
 
     @overload
@@ -121,20 +141,44 @@ class CompletenessEvaluator(PromptyEvaluatorBase[Union[str, float]]):
         :return: The completeness score.
         :rtype: Dict[str, Union[str, bool, float]]
         """
-        if kwargs.get("threshold", None) is None:
-            kwargs["threshold"] = 3
+        return super().__call__(*args, **kwargs)
 
-        completeness_result = super().__call__(*args, **kwargs)
-        if not isinstance(completeness_result, dict) or "completeness" not in completeness_result:
-            raise Exception("Completeness Result is invalid")
-        threshold = kwargs.get("threshold", 3.0)
-        response_completeness_score = completeness_result.get("completeness")
-        explanation = completeness_result.get("completeness_reason")
+    @override
+    async def _do_eval(self, eval_input: Dict) -> Dict[str, Union[float, str]]:  # type: ignore[override]
+        """Do completeness evaluation.
+        :param eval_input: The input to the evaluator. Expected to contain whatever inputs are needed for the _flow method
+        :type eval_input: Dict
+        :return: The evaluation result.
+        :rtype: Dict
+        """
+        # we override the _do_eval method as we want the output to be a dictionary,
+        # which is a different schema than _base_prompty_eval.py
+        if "ground_truth" not in eval_input and "response" not in eval_input:
+            raise EvaluationException(
+                message=f"Both query and response must be provided as input to the completeness evaluator.",
+                internal_message=f"Both query and response must be provided as input to the completeness evaluator.",
+                blame=ErrorBlame.USER_ERROR,
+                category=ErrorCategory.MISSING_FIELD,
+                target=ErrorTarget.INTENT_RESOLUTION_EVALUATOR,
+            )
+        llm_output = await self._flow(timeout=self._LLM_CALL_TIMEOUT, **eval_input)
 
-        is_response_complete = response_completeness_score >= threshold
+        # llm_output should always be a dictionary because the response_format of prompty is set to json_object, but checking anyway
+        if isinstance(llm_output, dict):
+            completeness_score = float(llm_output.get("completeness", math.nan))
 
-        return {
-            "is_response_complete": is_response_complete,
-            "response_completeness_score": response_completeness_score,
-            "explanation": explanation
-        }
+            reason = llm_output.get("completeness_reason", "")
+
+            score_result = 'pass' if completeness_score >= self.threshold else 'fail'
+            is_response_complete = completeness_score >= self.threshold
+
+            response_dict = {
+                "is_response_complete": is_response_complete,
+                "response_completeness": completeness_score,
+                "response_completeness_result": score_result,
+                "response_completeness_threshold": self.threshold,
+                "response_completeness_reason": reason,
+            }
+            return response_dict
+
+        return {self._result_key: math.nan}
