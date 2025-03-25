@@ -4,7 +4,7 @@
 
 ### Features Added
 - New Response Completeness Agentic Evaluator `IntentResolutionEvaluator` added.
-- New Response Completeness Agentic Evaluator `CompletenessEvaluator` added.
+- New Response Completeness Agentic Evaluator `ResponseCompletenessEvaluator` added.
 - New Task Adherence Agentic Evaluator `TaskAdherenceEvaluator` added.
 
 ### Breaking Changes
